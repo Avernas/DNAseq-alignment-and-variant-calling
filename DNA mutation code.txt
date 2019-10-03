@@ -1,0 +1,266 @@
+# BWA alignment 
+#sort the bam file and add read group and markduplication and index the bam
+# indel realignment
+#recalibrate quality score
+#generating recalibrating bam files
+#generate mpileup format and variant calls
+#generate a report file for QC
+
+# testing bwa in hpcc
+# index
+filedir=~/WholeExome_mutations
+export PATH=/shared/app/samtools-1.0/bin:$PATH
+
+cd ~/WholeExome_mutations
+/shared/app/BWA/bwa index ucsc.hg19.fasta
+
+#alignment using bwa and convert sam file to bam files
+for file in 12*-*-*
+do 
+cd $file 
+for f in *L*R1*gz
+do 
+/shared/app/BWA/bwa mem -t 2 -M $filedir/ucsc.hg19.fasta $f ${f%%R1*}"R2_001.fastq.gz" > ${f%%_R1*}.sam
+done
+for s in *L*sam
+do 
+samtools view -bS $s > ${s%%sam}"bam"
+rm $s
+done
+cd ..
+done
+
+#-----------------------------------------------------------------------------------------------------------------------------
+# sort/index the bam files  # I did not do this commend line since in the next phase I will use picard to sort and index    
+for file in 12*-*-*
+do 
+	cd $file 
+		for f in *L*bam
+			do 
+			samtools sort $f ${f%%.bam}
+			samtools index $f ${f}".bai"
+		done
+	cd ..
+done  
+##------------------------------------------------------------------------------------------------------------------------     
+
+
+#sort the bam file and add read group and markduplication and index the bam
+for file in 12*-*-*
+do 
+cd $file 
+	for f in *L*bam
+			do
+			g=${f##*_S*_}
+			java -jar /shared/app/picard-tools-1/picard-tools-1.96/SortSam.jar I=$f O=sort.bam SORT_ORDER=coordinate TMP_DIR=~/temp
+			java -jar /shared/app/picard-tools-1/picard-tools-1.96/AddOrReplaceReadGroups.jar I=sort.bam O=RG.bam \
+			RGLB=${f%%_S*}"_lib" RGPL=illumina RGPU=${g%%.bam} RGSM=${f%%_S*} RGID=${f%%.bam}           
+			java -jar /shared/app/picard-tools-1/picard-tools-1.96/MarkDuplicates.jar \
+			I=RG.bam O=${f%%.bam}"_RG_Dup.bam" M=${f%%.bam}"marked_dup_metrics.txt" TMP_DIR=~/temp			
+			java -jar /shared/app/picard-tools-1/picard-tools-1.96/BuildBamIndex.jar I=${f%%.bam}"_RG_Dup.bam"
+			rm sort.bam
+			rm RG.bam
+		done
+	cd ..
+done  
+
+# interesting way to isolate part of the word  
+#echo 12064-25-Arc_S34_L001_RG_MD | awk -F _ '$0=$3'
+#L001
+ 
+
+# indel realignment
+for file in 12*-*-*
+do
+cd $file
+for f in *L*RG_Dup.bam
+do
+java -jar /shared/app/GATK_Queue/GenomeAnalysisTK.jar -T RealignerTargetCreator \
+-R ~/WholeExome_mutations/ucsc.hg19.fasta -I $f -known ~/WholeExome_mutations/1000G_phase1.indels.hg19.vcf \
+-known ~/WholeExome_mutations/Mills*.vcf -o forIndelRealigner.intervals
+java -Xmx4g -jar /shared/app/GATK_Queue/GenomeAnalysisTK.jar -T IndelRealigner \
+-R ~/WholeExome_mutations/ucsc.hg19.fasta -I $f -known ~/WholeExome_mutations/1000G_phase1.indels.hg19.vcf \
+-known ~/WholeExome_mutations/Mills*.vcf -targetIntervals *.intervals -o ${f%%.bam}"_Reaglin.bam" 
+rm forIndelRealigner.intervals
+done
+cd ..
+done
+
+for file in 12*-*-*
+do
+cd $file
+rm *RG_Dup.bai
+rm *RG_Dup.bam
+cd ..
+done
+
+#recalibrate quality score
+
+for file in 12*-*-*
+do
+cd $file
+for f in *L*Reaglin.bam
+do
+java -jar /shared/app/GATK_Queue/GenomeAnalysisTK.jar -T BaseRecalibrator \
+-R ~/WholeExome_mutations/ucsc.hg19.fasta -I $f \
+-knownSites ~/WholeExome_mutations/dbsnp_138*.excluding_sites_after_129.vcf \
+-knownSites ~/WholeExome_mutations/1000G_phase1.indels.hg19.vcf \
+-knownSites ~/WholeExome_mutations/1000G_phase1.snps.high_confidence.hg19.vcf \
+-knownSites ~/WholeExome_mutations/Mills_and_1000G_gold_standard.indels.hg19.vcf \
+-o ${f%%RG_*}"recal_data.table"
+
+java -jar /shared/app/GATK_Queue/GenomeAnalysisTK.jar -T BaseRecalibrator \
+-R ~/WholeExome_mutations/ucsc.hg19.fasta -I $f \
+-knownSites ~/WholeExome_mutations/dbsnp_138*.excluding_sites_after_129.vcf \
+-knownSites ~/WholeExome_mutations/1000G_phase1.indels.hg19.vcf \
+-knownSites ~/WholeExome_mutations/1000G_phase1.snps.high_confidence.hg19.vcf \
+-knownSites ~/WholeExome_mutations/Mills_and_1000G_gold_standard.indels.hg19.vcf \
+-BQSR ${f%%RG_*}"recal_data.table" -o ${f%%RG_*}"post_recal_data.table" 
+done
+cd ..
+done
+
+#generating recalibrating bam files
+for file in 12*-*-*
+do
+cd $file
+for f in *L*Reaglin.bam
+do 
+java -jar /shared/app/GATK_Queue/GenomeAnalysisTK.jar -T PrintReads \
+-R ~/WholeExome_mutations/ucsc.hg19.fasta -I $f -BQSR ${f%%RG_*}"recal_data.table" \
+-o ${f%%.bam}"_recal.bam"
+done
+cd ..
+done
+
+for file in 12*-*-*
+do
+cd $file
+rm *L*Reaglin.bam
+rm *L*Reaglin.bai
+cd ..
+done
+
+
+# for generating plots # not working with hpcc
+java -jar /shared/app/GATK_Queue/GenomeAnalysisTK.jar -T AnalyzeCovariates \
+-R ~/WholeExome_mutations/*v37.fasta -before recal_data.table -after post_recal_data.table \
+-plots recalibration_plots.pdf -l DEBUG -csv Rtest.csv  
+  
+ 
+#generate mpileup format and variant calls
+mkdir 12064_variant_call
+mkdir 64_variant_call
+
+for file in 12*-25-*
+do
+cd $file
+for f in *L*_recal.bam
+do 
+echo $f>>bam_list.txt
+done
+samtools merge -b bam_list.txt ~/WholeExome_mutations/12064_variant_call/${f%%_S*}".bam"
+rm bam_list.txt
+cd ..
+done
+
+for file in *-27-*
+do
+cd $file
+for f in *L*_recal.bam
+do 
+echo $f>>bam_list.txt
+done
+samtools merge -b bam_list.txt ~/WholeExome_mutations/64_variant_call/${f%%_S*}".bam"
+rm bam_list.txt
+cd ..
+done
+
+#generate variant calls for tumor vs normal 
+samtools mpileup -f ~/WholeExome_mutations/ucsc.hg19.fasta 12064-25-N.bam 12064-25-Arc.bam | \
+java -jar /shared/app/VarScan/VarScan.v2.3.9.jar somatic --mpileup 12064-Arc-N --output-vcf 1 
+
+samtools mpileup -f ~/WholeExome_mutations/ucsc.hg19.fasta 12064-25-N.bam 12064-25-Prog.bam | \
+java -jar /shared/app/VarScan/VarScan.v2.3.9.jar somatic --mpileup 12064-Prog-N --output-vcf 1 
+
+#generating QC for coverage, insert size and duplication rate
+
+java -jar /shared/app/picard-tools-1/picard-tools-1.96/CollectInsertSizeMetrics.jar I=$f O=${f}_insert_size.xls H=${f}_insert_size_histogram.pdf M=0.5
+
+java -jar /shared/app/picard-tools-1/picard-tools-1.96/EstimateLibraryComplexity.jar I=$f O=${f}_complex_metrics.xls
+  
+# hpcc do not have  BedToIntervalList tools 
+java -jar /shared/app/picard-tools-1/picard-tools-1.96/BedToIntervalList.jar I=S07604715_AllTracks.bed O=list.interval_list SD=human_g1k_v37.dict
+
+java -jar /shared/app/picard-tools-1/picard-tools-1.96/CalculateHsMetrics.jar I=$f O=${f}_hs_metrics.txt R= ~/WholeExome_mutations/*v37.fasta \
+BAIT_INTERVALS=bait.interval_list \
+TARGET_INTERVALS=target.interval_list
+  
+
+for file in 12*-*-*
+do
+cd $file
+for f in *L*_recal.bam
+do
+java -jar /shared/app/picard-tools-1/picard-tools-1.96/CollectInsertSizeMetrics.jar I=$f O=${f%%.bam}_insert_size.xls H=${f}_insert_size_histogram.pdf M=0.5
+java -jar /shared/app/picard-tools-1/picard-tools-1.96/EstimateLibraryComplexity.jar I=$f O=${f%.bam}_complex_metrics.xls
+java -jar /shared/app/picard-tools-1/picard-tools-1.96/CalculateHsMetrics.jar I=$f O=${f%%.bam}_hs_metrics.txt R= ~/WholeExome_mutations/ucsc.hg19.fasta BAIT_INTERVALS=$filedir/interval_list TARGET_INTERVALS=$filedir/interval_list
+done
+cd ..
+done
+
+#generate a report file for QC
+for file in 12*-*-*
+do 
+cd $file
+for f in *insert_size.xls
+do
+echo ${f%%_RG_*} >>$filedir/file_name.txt
+awk 'FNR == 8  { print $1}' $f >>$filedir/insert_size.txt
+awk 'FNR == 8  { print $8}' ${f%%insert_size*}complex_metrics.xls >>$filedir/duplication.txt
+awk 'FNR == 8 ' ${f%%insert_size*}hs_metrics.txt >>$filedir/hs_metrics.txt
+done
+cd ..
+done
+
+Rscript $filedir/DNA_mutation_QC.R
+
+awk 'FNR == 7  { print $5}' *L001*hs_metrics.txt   # Bait Design Efficiency
+awk 'FNR == 7  { print $10}' *L001*hs_metrics.txt   # PCT_PF_UQ_READS
+awk 'FNR == 7  { print $12}' *L001*hs_metrics.txt   # PCT_PF_UQ_READS_ALIGNED
+awk 'FNR == 7  { print $18}' *L001*hs_metrics.txt   #PCT_SELECTED_BASES
+awk 'FNR == 7  { print $19}' *L001*hs_metrics.txt  #PCT_OFF_BAIT	
+awk 'FNR == 7  { print $20}' *L001*hs_metrics.txt   #ON_BAIT_VS_SELECTED
+awk 'FNR == 7  { print $21}' *L001*hs_metrics.txt  #MEAN_BAIT_COVERAGE
+awk 'FNR == 7  { print $22}' *L001*hs_metrics.txt  #MEAN_TARGET_COVERAGE
+awk 'FNR == 7  { print $23}' *L001*hs_metrics.txt   #PCT_USABLE_BASES_ON_BAIT	
+awk 'FNR == 7  { print $24}' *L001*hs_metrics.txt  #PCT_USABLE_BASES_ON_TARGET
+awk 'FNR == 7  { print $25}' *L001*hs_metrics.txt   #FOLD_ENRICHMENT
+awk 'FNR == 7  { print $28}' *L001*hs_metrics.txt  #PCT_TARGET_BASES_2X
+awk 'FNR == 7  { print $29}' *L001*hs_metrics.txt  #PCT_TARGET_BASES_10X
+awk 'FNR == 7  { print $30}' *L001*hs_metrics.txt   #PCT_TARGET_BASES_20X
+awk 'FNR == 7  { print $31}' *L001*hs_metrics.txt  #PCT_TARGET_BASES_30X
+awk 'FNR == 7  { print $32}' *L001*hs_metrics.txt   #PCT_TARGET_BASES_40X
+awk 'FNR == 7  { print $33}' *L001*hs_metrics.txt   #PCT_TARGET_BASES_50X
+awk 'FNR == 7  { print $34}' *L001*hs_metrics.txt   #PCT_TARGET_BASES_100X
+
+
+	
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+  
+  
+  
